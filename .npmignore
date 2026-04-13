@@ -1,0 +1,31 @@
+# Source
+src/**/*.ts
+tests/
+tsconfig.json
+tsup.config.ts
+vitest.config.ts
+
+# Documentation
+docs/
+*.md
+!README.md
+LICENSE
+
+# Environment
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+
+# Distribution
+dist/
+build/
+
+# Local files
+.DS_Store
+.env
+.npmrc
+.gitignore
+implementation_plan.md
+task.md
+walkthrough.md

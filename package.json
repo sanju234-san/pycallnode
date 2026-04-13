@@ -1,0 +1,37 @@
+{
+  "name": "pycall-node",
+  "version": "1.1.0",
+  "description": "Call Python ML/AI functions from Node.js as native async functions. Supports sklearn, PyTorch, YOLOv8, HuggingFace Transformers, ONNX, and more.",
+  "main": "src/index.js",
+  "keywords": [
+    "python",
+    "bridge",
+    "machine-learning",
+    "deep-learning",
+    "yolov8",
+    "pytorch",
+    "sklearn",
+    "transformers",
+    "onnx",
+    "async",
+    "node",
+    "ai",
+    "ml",
+    "inference",
+    "rag",
+    "langchain",
+    "llamaindex",
+    "embeddings",
+    "vision",
+    "ocr",
+    "deepface",
+    "clip",
+    "sam2",
+    "sentence-transformers"
+  ],
+  "author": "sanjeevni112",
+  "license": "MIT",
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
