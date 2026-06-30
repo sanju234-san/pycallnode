@@ -109,16 +109,25 @@ def ingest(backend: str, documentsPath: str, vectorstorePath: str, **kwargs) -> 
 
 def stream_query(backend: str, query: str, **kwargs) -> Generator[str, None, None]:
     """Generator for streaming RAG answers."""
-    # This is a simplified version using LangChain streaming
-    llm = _get_langchain_llm(kwargs.get('llm'), streaming=True)
-    # Re-use logic from query but with stream
-    # ... for brevity, focusing on the interface
-    # In a real impl, we'd hook into the LLM's callback handler
-    
-    # Simplified simulation for this build
-    response = llm.stream(query)
-    for chunk in response:
-        yield chunk.content if hasattr(chunk, 'content') else str(chunk)
+    if backend == 'llamaindex':
+        from llama_index.core import StorageContext, load_index_from_storage
+        cache_key = f"llamaindex:{kwargs.get('indexPath')}"
+        if cache_key not in RAG_STORES:
+            storage_context = StorageContext.from_defaults(persist_dir=kwargs.get('indexPath'))
+            RAG_STORES[cache_key] = load_index_from_storage(storage_context)
+        
+        index = RAG_STORES[cache_key]
+        query_engine = index.as_query_engine(streaming=True)
+        response = query_engine.query(query)
+        for token in response.response_gen:
+            yield token
+    else:
+        # LangChain or default
+        llm = _get_langchain_llm(kwargs.get('llm'), streaming=True)
+        response = llm.stream(query)
+        for chunk in response:
+            yield chunk.content if hasattr(chunk, 'content') else str(chunk)
+
 
 def _get_langchain_llm(llm_name_str: str, streaming: bool = False):
     """Helper to route LLM names to LangChain classes."""

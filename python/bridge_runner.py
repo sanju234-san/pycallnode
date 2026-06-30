@@ -22,6 +22,7 @@ import sys
 import json
 import asyncio
 import traceback
+import importlib
 import importlib.util
 import os
 from typing import Any, Callable, Dict
@@ -63,8 +64,28 @@ def _handle_request_sync(data: dict) -> dict:
     """Dispatch a single request and return a response dict."""
     request_id: str = data.get("id", "unknown")
     fn_name: str = data.get("function", "")
+    module_name: str = data.get("module", "")
     args: list = data.get("args", [])
     kwargs: dict = data.get("kwargs", {})
+
+    # If it is a dynamic module call
+    if module_name:
+        try:
+            module = importlib.import_module(module_name)
+            fn = getattr(module, fn_name)
+            result = fn(*args, **kwargs)
+
+            # Transparently run coroutines via asyncio.run()
+            if asyncio.iscoroutine(result):
+                result = asyncio.run(result)
+
+            return {
+                "id": request_id,
+                "status": "ok",
+                "result": result,
+            }
+        except Exception as exc:
+            return _make_error_response(request_id, exc)
 
     if fn_name not in _registry:
         return {
@@ -87,9 +108,38 @@ def _handle_request_sync(data: dict) -> dict:
             "id": request_id,
             "status": "ok",
             "result": result,
+            "type": "result"
         }
     except Exception as exc:
         return _make_error_response(request_id, exc)
+
+
+def _handle_stream(request_id: str, module_name: str, fn_name: str, args: list, kwargs: dict) -> None:
+    """Consumes a Python generator and writes stream chunks to stdout."""
+    try:
+        if module_name:
+            module = importlib.import_module(module_name)
+            func = getattr(module, fn_name)
+        else:
+            if fn_name not in _registry:
+                raise NameError(f"Function '{fn_name}' is not exposed")
+            func = _registry[fn_name]
+
+        gen = func(*args, **kwargs)
+        for chunk in gen:
+            _write_response({
+                "id": request_id,
+                "type": "chunk",
+                "status": "ok",
+                "result": chunk
+            })
+        _write_response({
+            "id": request_id,
+            "type": "end",
+            "status": "ok"
+        })
+    except Exception as exc:
+        _write_response(_make_error_response(request_id, exc))
 
 
 def _main_loop() -> None:
@@ -124,8 +174,24 @@ def _main_loop() -> None:
             })
             continue
 
-        response = _handle_request_sync(data)
-        _write_response(response)
+        req_type = data.get("type", "call")
+        request_id = data.get("id", "unknown")
+
+        if req_type == "stream":
+            module_name = data.get("module", "")
+            fn_name = data.get("function", "")
+            args = data.get("args", [])
+            kwargs = data.get("kwargs", {})
+            _handle_stream(request_id, module_name, fn_name, args, kwargs)
+        elif req_type == "ping":
+            _write_response({
+                "id": request_id,
+                "status": "ok",
+                "result": "pong"
+            })
+        else:
+            response = _handle_request_sync(data)
+            _write_response(response)
 
 
 def _load_user_script(script_path: str) -> None:
@@ -169,6 +235,16 @@ def main() -> None:
     if len(sys.argv) < 2:
         print("Usage: python bridge_runner.py <script.py>", file=sys.stderr)
         sys.exit(1)
+
+    # Add current working directory to sys.path
+    if os.getcwd() not in sys.path:
+        sys.path.insert(0, os.getcwd())
+
+    # Add package root to sys.path to resolve 'python.*' runner modules
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    package_root = os.path.dirname(script_dir)
+    if package_root not in sys.path:
+        sys.path.insert(0, package_root)
 
     user_script = sys.argv[1]
     _load_user_script(user_script)

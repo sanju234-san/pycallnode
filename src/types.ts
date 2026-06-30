@@ -5,6 +5,8 @@
 /** Message sent from Node → Python over stdin. */
 export interface RequestMessage {
   id: string;
+  type?: 'call' | 'stream' | 'ping';
+  module?: string;
   function: string;
   args: unknown[];
   kwargs: Record<string, unknown>;
@@ -48,6 +50,12 @@ export interface BridgeOptions {
 
   /** Current working directory for the Python process. */
   cwd?: string;
+
+  /** Automatically install missing packages (default: false). */
+  autoInstall?: boolean;
+
+  /** List of required Python packages to check. */
+  requiredPackages?: string[];
 }
 
 export interface CallOptions {
@@ -59,3 +67,4 @@ export interface BridgePoolOptions extends BridgeOptions {
   /** Number of worker processes in the pool (default: number of CPUs). */
   size?: number;
 }
+

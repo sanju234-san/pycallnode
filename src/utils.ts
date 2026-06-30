@@ -5,10 +5,6 @@
 /**
  * Normalizes Python paths for different OS.
  */
-function normalizePath(p) {
+export function normalizePath(p: string): string {
   return p.replace(/\\/g, '/');
 }
-
-module.exports = {
-  normalizePath
-};

@@ -2,7 +2,13 @@
   "name": "pycall-node",
   "version": "1.1.0",
   "description": "Call Python ML/AI functions from Node.js as native async functions. Supports sklearn, PyTorch, YOLOv8, HuggingFace Transformers, ONNX, and more.",
-  "main": "src/index.js",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run"
+  },
   "keywords": [
     "python",
     "bridge",
@@ -33,5 +39,15 @@
   "license": "MIT",
   "engines": {
     "node": ">=16.0.0"
+  },
+  "dependencies": {
+    "uuid": "^14.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.1",
+    "@types/uuid": "^10.0.0",
+    "tsup": "^8.5.1",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
   }
 }

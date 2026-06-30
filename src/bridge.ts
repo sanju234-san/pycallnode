@@ -12,6 +12,13 @@ import {
   PyRuntimeError,
 } from './errors.js';
 
+import { EnvManager } from './envmanager.js';
+import { InferenceBridge } from './inference.js';
+import { EmbeddingGenerator } from './embeddings.js';
+import { RAGConnector } from './rag.js';
+import { VisionBridge } from './vision.js';
+import { PyStream } from './streaming.js';
+
 import type {
   BridgeOptions,
   CallOptions,
@@ -55,6 +62,7 @@ export class Bridge extends EventEmitter {
   private proc: ChildProcess | null = null;
   private rl: ReadlineInterface | null = null;
   private pending = new Map<string, PendingCall>();
+  private streams = new Map<string, PyStream>();
   private restartCount = 0;
   private destroyed = false;
   private readyPromise: Promise<void> | null = null;
@@ -62,6 +70,9 @@ export class Bridge extends EventEmitter {
   private readyReject: ((err: Error) => void) | null = null;
   private stderrChunks: string[] = [];
   private _exposedFunctions: string[] = [];
+
+  public readonly envManager: EnvManager;
+  public readonly inference: InferenceBridge;
 
   constructor(options: BridgeOptions) {
     super();
@@ -75,7 +86,27 @@ export class Bridge extends EventEmitter {
       cwd: options.cwd,
     };
 
-    this.spawn();
+    this.envManager = new EnvManager({
+      pythonPath: this.opts.pythonPath,
+      autoInstall: options.autoInstall ?? false,
+      requiredPackages: options.requiredPackages ?? [],
+    });
+
+    this.inference = new InferenceBridge(this);
+
+    this.init();
+  }
+
+  get rag(): RAGConnector {
+    return new RAGConnector(this);
+  }
+
+  get embeddings(): EmbeddingGenerator {
+    return new EmbeddingGenerator(this);
+  }
+
+  get vision(): VisionBridge {
+    return new VisionBridge(this);
   }
 
   // ── Public API ─────────────────────────────────────────────────────────────
@@ -115,32 +146,65 @@ export class Bridge extends EventEmitter {
     options: CallOptions,
   ): Promise<unknown>;
 
+  /**
+   * Call a function in a dynamic Python module.
+   *
+   * @param module  - Python module name.
+   * @param func    - Function name inside module.
+   * @param args    - Positional arguments.
+   * @param kwargs  - Keyword arguments.
+   * @param options - Per-call options.
+   */
   async call(
-    fn: string,
+    module: string,
+    func: string,
+    args?: unknown[],
+    kwargs?: Record<string, unknown>,
+    options?: CallOptions,
+  ): Promise<unknown>;
+
+  async call(
+    fnOrModule: string,
     ...rest: unknown[]
   ): Promise<unknown> {
     await this.ready();
 
-    let args: unknown[];
+    let fn: string;
+    let module: string | undefined;
+    let args: unknown[] = [];
+    let kwargs: Record<string, unknown> | undefined;
     let timeout = this.opts.timeout;
 
-    // Determine calling convention
-    if (
-      rest.length === 2 &&
-      Array.isArray(rest[0]) &&
-      typeof rest[1] === 'object' &&
-      rest[1] !== null &&
-      'timeout' in rest[1]
-    ) {
-      // call(fn, [...args], { timeout })
-      args = rest[0] as unknown[];
-      timeout = (rest[1] as CallOptions).timeout ?? timeout;
+    // Check if it is a dynamic module call.
+    // It is dynamic if rest[0] is a string AND fnOrModule is not a registered exposed function.
+    const isDynamic = typeof rest[0] === 'string' && !this._exposedFunctions.includes(fnOrModule);
+
+    if (isDynamic) {
+      // call(module, func, args, kwargs, options)
+      module = fnOrModule;
+      fn = rest[0] as string;
+      args = (rest[1] as unknown[]) ?? [];
+      kwargs = rest[2] as Record<string, unknown>;
+      const options = rest[3] as CallOptions | undefined;
+      timeout = options?.timeout ?? timeout;
     } else {
-      // call(fn, arg1, arg2, ...)
-      args = rest;
+      // call(fn, ...args) or call(fn, args, options)
+      fn = fnOrModule;
+      if (
+        rest.length === 2 &&
+        Array.isArray(rest[0]) &&
+        typeof rest[1] === 'object' &&
+        rest[1] !== null &&
+        'timeout' in rest[1]
+      ) {
+        args = rest[0] as unknown[];
+        timeout = (rest[1] as CallOptions).timeout ?? timeout;
+      } else {
+        args = rest;
+      }
     }
 
-    return this.sendRequest(fn, args, timeout);
+    return this.sendRequest(fn, args, timeout, kwargs, module);
   }
 
   /**
@@ -157,6 +221,49 @@ export class Bridge extends EventEmitter {
     return this.sendRequest(fn, args, timeout, kwargs);
   }
 
+  /**
+   * Streams output from a Python generator.
+   */
+  stream(
+    module: string,
+    func: string,
+    args: unknown[] = [],
+    kwargs: Record<string, unknown> = {},
+  ): PyStream {
+    if (this.destroyed) {
+      throw new PyProcessError('Bridge has been destroyed', null, '');
+    }
+
+    const callId = uuidv4();
+    const stream = new PyStream(this, callId);
+    this.streams.set(callId, stream);
+
+    const msg: RequestMessage = {
+      id: callId,
+      type: 'stream',
+      module,
+      function: func,
+      args,
+      kwargs,
+    };
+
+    if (!this.proc?.stdin?.writable) {
+      stream.destroy(new PyProcessError('Python process stdin is not writable', null, ''));
+      this.streams.delete(callId);
+      return stream;
+    }
+
+    const line = JSON.stringify(msg) + '\n';
+    this.proc.stdin.write(line, 'utf-8', (err) => {
+      if (err) {
+        stream.destroy(new PyProcessError(`Failed to write to stdin: ${err.message}`, null, ''));
+        this.streams.delete(callId);
+      }
+    });
+
+    return stream;
+  }
+
   /** Gracefully shut down the Python process. */
   async destroy(): Promise<void> {
     if (this.destroyed) return;
@@ -169,6 +276,12 @@ export class Bridge extends EventEmitter {
         new PyProcessError('Bridge destroyed while call was pending', null, ''),
       );
       this.pending.delete(id);
+    }
+
+    // Destroy all active streams
+    for (const [id, stream] of this.streams) {
+      stream.destroy(new PyProcessError('Bridge destroyed while stream was active', null, ''));
+      this.streams.delete(id);
     }
 
     // Close stdin to signal the Python process to exit
@@ -203,10 +316,24 @@ export class Bridge extends EventEmitter {
 
   // ── Internal ───────────────────────────────────────────────────────────────
 
-  private spawn(): void {
+  private init(): void {
+    this.readyPromise = (async () => {
+      if (this.destroyed) return;
+      try {
+        await this.envManager.setup();
+        this.opts.pythonPath = this.envManager.pythonPath;
+        await this.spawn();
+      } catch (err: any) {
+        this.readyReject?.(err);
+        throw err;
+      }
+    })();
+  }
+
+  private spawn(): Promise<void> {
     this.stderrChunks = [];
 
-    this.readyPromise = new Promise<void>((res, rej) => {
+    const spawnPromise = new Promise<void>((res, rej) => {
       this.readyResolve = res;
       this.readyReject = rej;
     });
@@ -241,30 +368,56 @@ export class Bridge extends EventEmitter {
     // Handle process exit
     this.proc.on('exit', (code, signal) => this.handleExit(code, signal));
     this.proc.on('error', (err: Error) => this.handleSpawnError(err));
+
+    return spawnPromise;
   }
 
   private handleLine(line: string): void {
-    let msg: ResponseMessage;
+    let msg: any;
     try {
-      msg = JSON.parse(line) as ResponseMessage;
+      msg = JSON.parse(line);
     } catch {
       return; // ignore non-JSON lines (e.g. Python print() debug output)
     }
 
+    const callId = msg.id;
+
     // Handle the ready signal
-    if (msg.id === '__ready__' && msg.status === 'ok') {
-      this._exposedFunctions = (msg as any).result as string[] ?? [];
+    if (callId === '__ready__' && msg.status === 'ok') {
+      this._exposedFunctions = msg.result as string[] ?? [];
       this.restartCount = 0; // successful start resets counter
       this.readyResolve?.();
       this.emit('ready', this._exposedFunctions);
       return;
     }
 
-    const pending = this.pending.get(msg.id);
-    if (!pending) return; // orphan response (e.g. after timeout)
+    // Handle stream chunks/end
+    if (msg.type === 'chunk' || msg.type === 'end') {
+      const stream = this.streams.get(callId);
+      if (stream) {
+        if (msg.type === 'chunk') {
+          stream.push(msg.result);
+        } else {
+          stream.end();
+          this.streams.delete(callId);
+        }
+      }
+      return;
+    }
+
+    const pending = this.pending.get(callId);
+    if (!pending) {
+      // Might be a stream error
+      const stream = this.streams.get(callId);
+      if (stream && msg.status === 'error') {
+        stream.destroy(new PyRuntimeError(msg.error, msg.type, msg.traceback));
+        this.streams.delete(callId);
+      }
+      return;
+    }
 
     if (pending.timer) clearTimeout(pending.timer);
-    this.pending.delete(msg.id);
+    this.pending.delete(callId);
 
     if (msg.status === 'ok') {
       pending.resolve(msg.result);
@@ -299,15 +452,31 @@ export class Bridge extends EventEmitter {
       );
     }
     this.pending.clear();
+
+    // Destroy all active streams
+    for (const [id, stream] of this.streams) {
+      stream.destroy(new PyProcessError(`Python process exited unexpectedly (code=${code})`, code, stderr));
+      this.streams.delete(id);
+    }
+
     this.rl?.close();
 
     this.emit('exit', code, signal);
 
-    // Attempt auto-restart unless destroyed
+    // Attempt auto-restart with exponential backoff unless destroyed
     if (!this.destroyed && this.restartCount < this.opts.maxRestarts) {
-      this.restartCount++;
-      this.emit('restart', this.restartCount);
-      this.spawn();
+      const count = ++this.restartCount;
+      this.emit('restart', count);
+      
+      const delay = Math.min(Math.pow(2, count - 1) * 1000, 10000);
+      
+      setTimeout(() => {
+        if (!this.destroyed) {
+          this.spawn().catch((err) => {
+            this.emit('error', err);
+          });
+        }
+      }, delay);
     } else if (!this.destroyed) {
       this.emit('crash', new PyProcessError(
         `Python process crashed ${this.opts.maxRestarts + 1} times; giving up`,
@@ -328,6 +497,7 @@ export class Bridge extends EventEmitter {
     args: unknown[],
     timeoutMs: number,
     kwargs?: Record<string, unknown>,
+    module?: string,
   ): Promise<unknown> {
     return new Promise<unknown>((resolve, reject) => {
       if (this.destroyed) {
@@ -343,6 +513,8 @@ export class Bridge extends EventEmitter {
       const id = uuidv4();
       const msg: RequestMessage = {
         id,
+        type: 'call',
+        module,
         function: fn,
         args,
         kwargs: kwargs ?? {},
